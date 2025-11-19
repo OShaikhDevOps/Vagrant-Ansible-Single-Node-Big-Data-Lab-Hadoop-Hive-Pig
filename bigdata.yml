@@ -1,0 +1,394 @@
+---
+- name: Setup single-node big data tools (Hadoop, Hive, Pig)
+  hosts: all
+  become: true
+
+  vars:
+    user: hadoop
+    user_home: "/home/{{ user }}"
+
+    java_home: "/usr/lib/jvm/java-8-openjdk-amd64"
+
+    hadoop_version: "3.3.3"
+    hadoop_home: "/usr/local/hadoop"
+    hadoop_archive: "hadoop-{{ hadoop_version }}.tar.gz"
+    hadoop_url: "https://archive.apache.org/dist/hadoop/common/hadoop-{{ hadoop_version }}/{{ hadoop_archive }}"
+
+    pig_version: "0.16.0"
+    pig_archive: "pig-{{ pig_version }}.tar.gz"
+    pig_url: "https://dlcdn.apache.org/pig/pig-{{ pig_version }}/pig-{{ pig_version }}.tar.gz"
+    pig_home: "/usr/local/hadoop/pig"
+
+    hive_version: "3.1.2"
+    hive_archive: "apache-hive-{{ hive_version }}-bin.tar.gz"
+    hive_url: "http://archive.apache.org/dist/hive/hive-{{ hive_version }}/{{ hive_archive }}"
+    hive_home: "/usr/local/hive"
+
+  tasks:
+    # ---------------------------------------------------------
+    # Hadoop user + Java
+    # ---------------------------------------------------------
+    - name: Ensure Hadoop user exists
+      user:
+        name: "{{ user }}"
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Ensure Java 8 is installed
+      apt:
+        name: openjdk-8-jdk
+        state: present
+        update_cache: yes
+
+    # ---------------------------------------------------------
+    # .profile for Hadoop user
+    # ---------------------------------------------------------
+    - name: Ensure .profile exists
+      file:
+        path: "{{ user_home }}/.profile"
+        state: touch
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+
+    - name: Add JAVA_HOME to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: "export JAVA_HOME={{ java_home }}"
+        state: present
+
+    - name: Add HADOOP_HOME to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: "export HADOOP_HOME={{ hadoop_home }}"
+        state: present
+
+    - name: Add Hadoop bin to PATH
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export PATH="$PATH:$HADOOP_HOME/bin"'
+        state: present
+
+    - name: Add Hadoop sbin to PATH
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export PATH="$PATH:$HADOOP_HOME/sbin"'
+        state: present
+
+    # ---------------------------------------------------------
+    # Hadoop install
+    # ---------------------------------------------------------
+    - name: Create Hadoop home directory
+      file:
+        path: "{{ hadoop_home }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0755"
+
+    - name: Download Hadoop tarball
+      get_url:
+        url: "{{ hadoop_url }}"
+        dest: "/tmp/{{ hadoop_archive }}"
+        mode: "0644"
+
+    - name: Extract Hadoop to HADOOP_HOME (strip top-level directory)
+      unarchive:
+        src: "/tmp/{{ hadoop_archive }}"
+        dest: "{{ hadoop_home }}"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+
+    # ---------------------------------------------------------
+    # Hadoop core-site.xml / hdfs-site.xml
+    # ---------------------------------------------------------
+    - name: Configure core-site.xml
+      copy:
+        dest: "{{ hadoop_home }}/etc/hadoop/core-site.xml"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>fs.defaultFS</name>
+              <value>hdfs://localhost:9000</value>
+            </property>
+          </configuration>
+
+    - name: Configure hdfs-site.xml
+      copy:
+        dest: "{{ hadoop_home }}/etc/hadoop/hdfs-site.xml"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>dfs.replication</name>
+              <value>1</value>
+            </property>
+          </configuration>
+
+    # ---------------------------------------------------------
+    # SSH for passwordless localhost
+    # ---------------------------------------------------------
+    - name: Install openssh-server
+      apt:
+        name: openssh-server
+        state: present
+
+    - name: Create .ssh directory
+      file:
+        path: "{{ user_home }}/.ssh"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0700"
+
+    - name: Generate SSH key (localhost)
+      openssh_keypair:
+        path: "{{ user_home }}/.ssh/id_rsa"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        type: rsa
+        size: 2048
+
+    - name: Add pub key to authorized_keys
+      shell: |
+        cat "{{ user_home }}/.ssh/id_rsa.pub" >> "{{ user_home }}/.ssh/authorized_keys"
+      args:
+        creates: "{{ user_home }}/.ssh/authorized_keys"
+
+    - name: Fix permissions on authorized_keys
+      file:
+        path: "{{ user_home }}/.ssh/authorized_keys"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0600"
+
+    # ---------------------------------------------------------
+    # hadoop-env.sh + ownership + namenode format
+    # ---------------------------------------------------------
+    - name: Set JAVA_HOME in hadoop-env.sh
+      lineinfile:
+        path: "{{ hadoop_home }}/etc/hadoop/hadoop-env.sh"
+        regexp: '^export JAVA_HOME='
+        line: 'export JAVA_HOME={{ java_home }}'
+        insertafter: EOF
+
+    - name: Fix Hadoop directory ownership (including logs)
+      file:
+        path: "{{ hadoop_home }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        recurse: true
+
+    - name: Format HDFS namenode only once (using ident string "hadoop")
+      command: "{{ hadoop_home }}/bin/hdfs namenode -format -force"
+      args:
+        creates: "{{ user_home }}/.hadoop_namenode_formatted"
+      environment:
+        HADOOP_IDENT_STRING: "{{ user }}"
+
+    - name: Create marker for namenode formatted
+      file:
+        path: "{{ user_home }}/.hadoop_namenode_formatted"
+        state: touch
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+
+    # ---------------------------------------------------------
+    # Install Pig
+    # ---------------------------------------------------------
+    - name: Create Pig home directory
+      file:
+        path: "{{ pig_home }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0755"
+
+    - name: Download Pig {{ pig_version }}
+      get_url:
+        url: "{{ pig_url }}"
+        dest: "/tmp/{{ pig_archive }}"
+        mode: "0644"
+
+    - name: Extract Pig into PIG_HOME (strip top-level directory)
+      unarchive:
+        src: "/tmp/{{ pig_archive }}"
+        dest: "{{ pig_home }}"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+
+    - name: Add PIG_HOME to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: "export PIG_HOME={{ pig_home }}"
+        state: present
+
+    - name: Add PIG_CONF_DIR to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export PIG_CONF_DIR=$PIG_HOME/conf'
+        state: present
+
+    - name: Add PIG_CLASSPATH to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export PIG_CLASSPATH=$PIG_CONF_DIR:$HADOOP_HOME/etc/hadoop/'
+        state: present
+
+    - name: Add Pig bin to PATH
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export PATH="$PATH:$PIG_HOME/bin"'
+        state: present
+
+    # ---------------------------------------------------------
+    # Install Hive
+    # ---------------------------------------------------------
+    - name: Create Hive home directory
+      file:
+        path: "{{ hive_home }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0755"
+
+    - name: Download Hive {{ hive_version }}
+      get_url:
+        url: "{{ hive_url }}"
+        dest: "/tmp/{{ hive_archive }}"
+        mode: "0644"
+
+    - name: Extract Hive into HIVE_HOME (strip top-level directory)
+      unarchive:
+        src: "/tmp/{{ hive_archive }}"
+        dest: "{{ hive_home }}"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+
+    - name: Add HIVE_HOME to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: "export HIVE_HOME={{ hive_home }}"
+        state: present
+
+    - name: Add Hive bin to PATH
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export PATH="$PATH:$HIVE_HOME/bin"'
+        state: present
+
+    - name: Add HIVE_CONF_DIR to .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export HIVE_CONF_DIR=$HIVE_HOME/conf'
+        state: present
+
+    - name: Add Hadoop + Hive libs to CLASSPATH in .profile
+      lineinfile:
+        path: "{{ user_home }}/.profile"
+        line: 'export CLASSPATH=$CLASSPATH:$HADOOP_HOME/lib/*:$HIVE_HOME/lib/*:.'
+        state: present
+
+    # ---------------------------------------------------------
+    # Hive env + site configuration
+    # ---------------------------------------------------------
+    - name: Create hive-env.sh from template
+      copy:
+        src: "{{ hive_home }}/conf/hive-env.sh.template"
+        dest: "{{ hive_home }}/conf/hive-env.sh"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+        remote_src: yes
+
+    - name: Set HADOOP_HOME in hive-env.sh
+      lineinfile:
+        path: "{{ hive_home }}/conf/hive-env.sh"
+        regexp: '^#?HADOOP_HOME='
+        line: 'HADOOP_HOME={{ hadoop_home }}'
+        insertafter: EOF
+
+    - name: Create hive-site.xml from default template
+      copy:
+        src: "{{ hive_home }}/conf/hive-default.xml.template"
+        dest: "{{ hive_home }}/conf/hive-site.xml"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+        remote_src: yes
+
+    - name: Ensure Hive temp dir exists
+      file:
+        path: "/tmp/hive/java"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0777"
+
+    - name: Add temp dir + system user properties into hive-site.xml
+      blockinfile:
+        path: "{{ hive_home }}/conf/hive-site.xml"
+        insertbefore: "</configuration>"
+        block: |
+          <property>
+            <name>system:java.io.tmpdir</name>
+            <value>/tmp/hive/java</value>
+          </property>
+          <property>
+            <name>system:user.name</name>
+            <value>${user.name}</value>
+          </property>
+
+    - name: Update Derby metastore database path in hive-site.xml
+      replace:
+        path: "{{ hive_home }}/conf/hive-site.xml"
+        regexp: 'jdbc:derby:;databaseName=metastore_db;create=true'
+        replace: 'jdbc:derby:;databaseName=/usr/local/hive/metastore_db;create=true'
+
+    - name: Remove problematic comment line from hive-site.xml
+      lineinfile:
+        path: "{{ hive_home }}/conf/hive-site.xml"
+        regexp: 'Ensures commands with OVERWRITE'
+        state: absent
+
+    # ---------------------------------------------------------
+    # Strip illegal control chars from hive-site.xml (prof's note)
+    # ---------------------------------------------------------
+     
+
+    # ---------------------------------------------------------
+    # HDFS warehouse for Hive
+    # ---------------------------------------------------------
+    - name: Create Hive warehouse directory in HDFS
+      shell: "sudo -u {{ user }} {{ hadoop_home }}/bin/hdfs dfs -mkdir -p /user/hive/warehouse"
+      args:
+        warn: false
+      ignore_errors: true
+
+    - name: Set permissions on Hive warehouse directory
+      shell: "sudo -u {{ user }} {{ hadoop_home }}/bin/hdfs dfs -chmod g+w /user/hive/warehouse"
+      args:
+        warn: false
+      ignore_errors: true
+
+    - name: Initialize Hive metastore (Derby) with schematool
+      shell: "sudo -u {{ user }} {{ hive_home }}/bin/schematool -dbType derby -initSchema"
+      args:
+        chdir: "{{ hive_home }}"
+        creates: "{{ hive_home }}/metastore_db"
+      environment:
+        HIVE_HOME: "{{ hive_home }}"
+        HADOOP_HOME: "{{ hadoop_home }}"
+        JAVA_HOME: "{{ java_home }}"
+        PATH: "/usr/bin:/bin:{{ hadoop_home }}/bin:{{ hadoop_home }}/sbin:{{ hive_home }}/bin"
