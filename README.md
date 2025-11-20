@@ -16,12 +16,12 @@ The setup installs and configures Hadoop, Hive, and Pig inside an Ubuntu virtual
 
 ---
 
-## Repository Structure
-.
+## Repository Structure`
+```
 ├── Vagrantfile # Creates VM and executes Ansible playbook
 ├── bigdata.yml # Ansible playbook for Hadoop + Hive + Pig
 └── README.md
-
+```
 
 ---
 
